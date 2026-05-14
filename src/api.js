@@ -1,214 +1,149 @@
 import axios from "axios";
 
-// ── Base instance ─────────────────────────────────────────────────────────────
+const BASE = import.meta.env.VITE_API_URL || "http://localhost:5000/api";
+
+/* ── Axios instance ─────────────────────────────────────────── */
 const api = axios.create({
-  baseURL: import.meta.env.VITE_API_URL || "http://localhost:5000/api",
+  baseURL: BASE,
   headers: { "Content-Type": "application/json" },
-  timeout: 10000,
+  timeout: 10_000,
 });
 
-// ── Request interceptor: attach JWT ──────────────────────────────────────────
-api.interceptors.request.use((config) => {
-  const token = localStorage.getItem("access_token");
-  if (token) config.headers.Authorization = `Bearer ${token}`;
-  return config;
+/* ── Attach token on every request ─────────────────────────── */
+api.interceptors.request.use((cfg) => {
+  const token = localStorage.getItem("cq_access");
+  if (token) cfg.headers.Authorization = `Bearer ${token}`;
+  return cfg;
 });
 
-// ── Response interceptor: auto-refresh expired token ─────────────────────────
-let isRefreshing = false;
-let failedQueue  = [];
+/* ── Auto-refresh on 401 ────────────────────────────────────── */
+let refreshing = false;
+let queue = [];
 
-function processQueue(error, token = null) {
-  failedQueue.forEach((p) => (error ? p.reject(error) : p.resolve(token)));
-  failedQueue = [];
-}
+const flush = (err, token) =>
+  queue.forEach((p) => (err ? p.reject(err) : p.resolve(token)));
 
 api.interceptors.response.use(
-  (res) => res,
+  (r) => r,
   async (err) => {
-    const original = err.config;
+    const orig = err.config;
+    if (err.response?.status !== 401 || orig._retry) return Promise.reject(err);
 
-    if (err.response?.status === 401 && !original._retry) {
-      if (isRefreshing) {
-        return new Promise((resolve, reject) => {
-          failedQueue.push({ resolve, reject });
-        })
-          .then((token) => {
-            original.headers.Authorization = `Bearer ${token}`;
-            return api(original);
-          })
-          .catch(Promise.reject.bind(Promise));
-      }
-
-      original._retry = true;
-      isRefreshing    = true;
-
-      try {
-        const refresh = localStorage.getItem("refresh_token");
-        if (!refresh) throw new Error("No refresh token");
-
-        const { data } = await axios.post(
-          `${api.defaults.baseURL}/auth/refresh`,
-          {},
-          { headers: { Authorization: `Bearer ${refresh}` } }
-        );
-
-        localStorage.setItem("access_token", data.access_token);
-        api.defaults.headers.common.Authorization = `Bearer ${data.access_token}`;
-        processQueue(null, data.access_token);
-        return api(original);
-      } catch (refreshErr) {
-        processQueue(refreshErr, null);
-        localStorage.removeItem("access_token");
-        localStorage.removeItem("refresh_token");
-        window.location.href = "/login";
-        return Promise.reject(refreshErr);
-      } finally {
-        isRefreshing = false;
-      }
+    if (refreshing) {
+      return new Promise((resolve, reject) => queue.push({ resolve, reject }))
+        .then((t) => { orig.headers.Authorization = `Bearer ${t}`; return api(orig); });
     }
 
-    return Promise.reject(err);
+    orig._retry = true;
+    refreshing  = true;
+
+    try {
+      const refresh = localStorage.getItem("cq_refresh");
+      if (!refresh) throw new Error("no refresh token");
+
+      const { data } = await axios.post(`${BASE}/auth/refresh`, {}, {
+        headers: { Authorization: `Bearer ${refresh}` },
+      });
+      localStorage.setItem("cq_access", data.access_token);
+      api.defaults.headers.common.Authorization = `Bearer ${data.access_token}`;
+      flush(null, data.access_token);
+      return api(orig);
+    } catch (e) {
+      flush(e);
+      localStorage.removeItem("cq_access");
+      localStorage.removeItem("cq_refresh");
+      localStorage.removeItem("cq_user");
+      window.location.href = "/login";
+      return Promise.reject(e);
+    } finally {
+      refreshing = false;
+      queue = [];
+    }
   }
 );
 
-// ── Helpers ───────────────────────────────────────────────────────────────────
-function saveTokens({ access_token, refresh_token }) {
-  if (access_token)  localStorage.setItem("access_token",  access_token);
-  if (refresh_token) localStorage.setItem("refresh_token", refresh_token);
-}
-
-function clearTokens() {
-  localStorage.removeItem("access_token");
-  localStorage.removeItem("refresh_token");
-}
-
-// ═══════════════════════════════════════════════════════════════════════════════
-// AUTH
-// ═══════════════════════════════════════════════════════════════════════════════
+/* ═══════════════════════════════════════════
+   AUTH
+═══════════════════════════════════════════ */
 export const authAPI = {
-  /** Register a new user */
   register: async (username, email, password) => {
     const { data } = await api.post("/auth/register", { username, email, password });
-    saveTokens(data);
+    localStorage.setItem("cq_access",  data.access_token);
+    localStorage.setItem("cq_refresh", data.refresh_token);
+    localStorage.setItem("cq_user",    JSON.stringify(data.user));
     return data;
   },
 
-  /** Log in */
   login: async (email, password) => {
     const { data } = await api.post("/auth/login", { email, password });
-    saveTokens(data);
+    localStorage.setItem("cq_access",  data.access_token);
+    localStorage.setItem("cq_refresh", data.refresh_token);
+    localStorage.setItem("cq_user",    JSON.stringify(data.user));
     return data;
   },
 
-  /** Log out (clears local tokens) */
   logout: () => {
-    clearTokens();
+    ["cq_access","cq_refresh","cq_user"].forEach((k) => localStorage.removeItem(k));
   },
 
-  /** Get current user profile */
   me: async () => {
     const { data } = await api.get("/auth/me");
+    localStorage.setItem("cq_user", JSON.stringify(data));
     return data;
   },
 
-  /** Update profile (username, avatar_emoji, new_password) */
-  updateMe: async (updates) => {
-    const { data } = await api.patch("/auth/me", updates);
+  updateMe: async (payload) => {
+    const { data } = await api.patch("/auth/me", payload);
+    localStorage.setItem("cq_user", JSON.stringify(data));
     return data;
   },
 
-  /** Check if user is logged in (token present) */
-  isLoggedIn: () => !!localStorage.getItem("access_token"),
+  cached: () => {
+    try { return JSON.parse(localStorage.getItem("cq_user")); } catch { return null; }
+  },
+
+  isLoggedIn: () => !!localStorage.getItem("cq_access"),
 };
 
-// ═══════════════════════════════════════════════════════════════════════════════
-// CONTENT  — countries, topics, questions
-// ═══════════════════════════════════════════════════════════════════════════════
+/* ═══════════════════════════════════════════
+   CONTENT
+═══════════════════════════════════════════ */
 export const contentAPI = {
-  /** List all countries, optional region filter & search */
-  getCountries: async ({ region, q } = {}) => {
-    const params = {};
-    if (region && region !== "all") params.region = region;
-    if (q) params.q = q;
+  getCountries: async (params = {}) => {
     const { data } = await api.get("/content/countries", { params });
     return data;
   },
-
-  /** Single country with full topics */
   getCountry: async (slug) => {
     const { data } = await api.get(`/content/countries/${slug}`);
     return data;
   },
-
-  /** All topics for a country */
   getTopics: async (slug) => {
     const { data } = await api.get(`/content/countries/${slug}/topics`);
     return data;
   },
-
-  /** Single topic by ID */
-  getTopic: async (topicId) => {
-    const { data } = await api.get(`/content/topics/${topicId}`);
+  getTopic: async (id) => {
+    const { data } = await api.get(`/content/topics/${id}`);
     return data;
   },
-
-  /** Quiz questions for a country */
-  getQuestions: async (slug, { difficulty, topic, limit = 10 } = {}) => {
-    const params = { limit };
-    if (difficulty) params.difficulty = difficulty;
-    if (topic)      params.topic      = topic;
+  getQuestions: async (slug, params = {}) => {
     const { data } = await api.get(`/content/countries/${slug}/questions`, { params });
     return data;
   },
-
-  /** Check a single answer */
-  checkAnswer: async (questionId, answerIndex) => {
-    const { data } = await api.post(`/content/questions/${questionId}/answer`, {
-      answer_index: answerIndex,
-    });
+  checkAnswer: async (qid, answer_index) => {
+    const { data } = await api.post(`/content/questions/${qid}/answer`, { answer_index });
     return data;
   },
 };
 
-// ═══════════════════════════════════════════════════════════════════════════════
-// PROGRESS — user progress, quiz submission, leaderboard
-// ═══════════════════════════════════════════════════════════════════════════════
+/* ═══════════════════════════════════════════
+   PROGRESS
+═══════════════════════════════════════════ */
 export const progressAPI = {
-  /** All progress for the current user */
-  getAll: async () => {
-    const { data } = await api.get("/progress/");
-    return data;
-  },
-
-  /** Progress for one country */
-  getCountry: async (slug) => {
-    const { data } = await api.get(`/progress/${slug}`);
-    return data;
-  },
-
-  /** Mark a topic as read */
-  markTopic: async (slug) => {
-    const { data } = await api.post(`/progress/${slug}/topic`);
-    return data;
-  },
-
-  /**
-   * Submit a completed quiz
-   * @param {string} slug  - country slug
-   * @param {Array}  answers - [{ question_id, answer_index }, ...]
-   */
-  submitQuiz: async (slug, answers) => {
-    const { data } = await api.post(`/progress/${slug}/quiz`, { answers });
-    return data;
-  },
-
-  /** Global XP leaderboard */
-  leaderboard: async () => {
-    const { data } = await api.get("/progress/leaderboard");
-    return data;
-  },
+  getAll:       async ()           => { const { data } = await api.get("/progress/");                          return data; },
+  getCountry:   async (slug)       => { const { data } = await api.get(`/progress/${slug}`);                   return data; },
+  markTopic:    async (slug)       => { const { data } = await api.post(`/progress/${slug}/topic`);            return data; },
+  submitQuiz:   async (slug, ans)  => { const { data } = await api.post(`/progress/${slug}/quiz`, {answers:ans}); return data; },
+  leaderboard:  async ()           => { const { data } = await api.get("/progress/leaderboard");               return data; },
 };
 
-// ── Default export for ad-hoc calls ──────────────────────────────────────────
 export default api;
